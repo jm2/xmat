@@ -141,7 +141,7 @@ All hosts should run the same version; `xmat doctor` flags mismatches.
    ```sh
    xmat doctor              # ssh, xmat/git versions, hub access, desktop agents
    xmat run                 # HEAD on every target
-   xmat run --dirty         # your uncommitted work, including untracked files
+   xmat run --dirty         # your uncommitted work, including untracked (non-ignored) files
    xmat log win-x64         # last 100 lines of the first failing step
    ```
 
@@ -150,7 +150,7 @@ All hosts should run the same version; `xmat doctor` flags mismatches.
 | Command | What it does |
 | --- | --- |
 | `xmat run [<commit>]` | Build/test a commit (default `HEAD`) on the targets. `--dirty` snapshots the working tree instead. `-t a,b` picks targets, `--steps x,y` replaces the default steps, `--with smoke` adds non-default ones, `--json` prints everything machine-readably, `-q` drops progress lines. |
-| `xmat log <target> [<step>]` | Print a step log from the last run (default: the first step that did not pass). `-n N` last N lines (default 100, `0` = all), `--grep text`. |
+| `xmat log <target> [<step>]` | Print a step log from the last run (default: the first step that did not pass). `-n N` last N lines (default 100, `0` = all), `--grep text`, `--raw` to keep terminal control sequences. |
 | `xmat get <target> <path>` | Download a file from that target's run directory, e.g. `artifacts/smoke/smoke.png` or `result.json`. `-o dest`, `-o -` for stdout. |
 | `xmat doctor` | Check every target: reachable, xmat and git versions, OS/arch, hub fetch access, desktop agent, available shells. |
 | `xmat init [--fleet]` | Write a commented starter `.xmat.toml` (or fleet file). |
@@ -184,11 +184,11 @@ Looked up in `--fleet`, `$XMAT_FLEET`, `$XDG_CONFIG_HOME/xmat/fleet.toml`,
 | --- | --- |
 | `hub.push` | Where the controller pushes; `{repo}` is replaced by the repo name. A local path, `file://`, `ssh://` or `host:path` URL. Local and ssh hubs are created on first use (ssh hubs must be POSIX hosts). |
 | `hub.fetch` | URL hosts fetch from, if different from `push` (e.g. push to a local path on the hub machine itself). |
-| `ssh.command` | ssh command prefix. Default `["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]`. |
+| `ssh.command` | ssh command prefix. Default `["ssh", "-T", "-a", "-x", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]`. If you override it, keep forwarding disabled (see [Security](#security)). |
 | `target.<name>.host` | ssh destination. |
 | `target.<name>.local` | `true` to run on this machine without ssh. |
 | `target.<name>.xmat` | xmat command on the host if it is not on `PATH` (e.g. `'C:\tools\xmat.exe'`). |
-| `target.<name>.root` | Workspace root on the host. Default `~/xmat` (`%USERPROFILE%\xmat`), or `$XMAT_ROOT`. |
+| `target.<name>.root` | Workspace root on the host. Default `~/xmat` (`%USERPROFILE%\xmat`), or `$XMAT_ROOT`. Created private to the user; an existing directory others can write to is refused. |
 | `target.<name>.hub_fetch` | Per-target hub URL, e.g. when one host reaches the hub under a different name. |
 | `target.<name>.os`, `.arch` | Expected `GOOS`/`GOARCH` (`linux`, `darwin`/`macos`, `windows`; `amd64`, `arm64`). A mismatch is reported instead of building. |
 
@@ -202,7 +202,7 @@ Read from the commit under test, so steps are versioned with the code.
 | `targets` | Default targets for this repo. Default: every fleet target. |
 | `keep_runs` | Run directories each host keeps per target (default 20). |
 | `env` | Environment for every step, e.g. `env = { CMAKE_GENERATOR = "Ninja" }`. |
-| `clean` | `git clean -ffdx` before every run (slow: defeats incremental builds). |
+| `clean` | `git clean -ffdx` before every run (slow: defeats incremental builds). Without it, untracked files left by earlier commits persist in the checkout, which matters for build systems that glob sources. |
 | `submodules` | Update submodules (default: when `.gitmodules` exists). Hosts fetch submodules from their own URLs. |
 | `[os.<os>]`, `[target.<name>]` | Override `env`, `clean`, `submodules` for an OS or target; `skip = true` skips the target. |
 
@@ -314,17 +314,91 @@ without burning context. A snippet for `AGENTS.md` / `CLAUDE.md`:
 ## Host workspace layout
 
 ```
-~/xmat/
-  repos/<repo>/mirror.git              bare cache of the hub
-  repos/<repo>/wt/<target>/            persistent checkout, reused for incremental builds
-  repos/<repo>/runs/<run>-<target>/    <step>.log, scripts/, artifacts/, result.json
-  repos/<repo>/lock-<target>           serializes runs of one repo+target
-  desktop/                             spool shared with `xmat desktop`
+~/xmat/                                    private: 0700, or a protected ACL on Windows
+  repos/<repo>/mirror.git                  bare cache of the hub
+  repos/<repo>/wt/<target>/                persistent checkout, reused for incremental builds
+  repos/<repo>/runs/<target>/<run>/        <step>.log, scripts/, artifacts/, result.json
+  repos/<repo>/lock-<target>, lock-mirror  serialize runs of one repo+target, and mirror updates
+  desktop/                                 spool shared with `xmat desktop`
 ```
 
 Concurrent runs of the same repo and target on one host queue behind a lock
 (the OS releases it if a run dies). Different targets on the same host run in
 parallel.
+
+## Security
+
+**Trust model.** `xmat run` executes code from the commit under test on
+every target, and the steps themselves come from that commit's
+`.xmat.toml`, exactly as CI does. Whoever can run `xmat run` on your
+controller (you, or a coding agent you let do it) can run code as the host
+account on every machine in the fleet. Treat `xmat run <someone's branch>`
+like running their Makefile on all of your machines at once, and review
+changes to `.xmat.toml` like changes to a CI workflow. A host trusts whoever
+can start `xmat host` on it over ssh; xmat adds no authentication of its own
+beyond ssh.
+
+**What xmat does about it:**
+
+- **Build exactly one tree.** Hosts build exactly the commit id the
+  controller names. It is checked against the object id, so refs someone
+  plants in the hub cannot substitute another tree.
+- **Keep ssh narrow.** ssh runs with agent, X11 and port forwarding off. If
+  a forwarded agent socket shows up anyway, it is removed from the step
+  environment, so commit code cannot borrow your keys to reach other
+  machines.
+- **Keep the workspace private.** Git executes hooks and config from the
+  mirror, and scripts and the desktop spool run code, so the workspace root
+  is created private (0700, or a protected ACL on Windows). xmat refuses a
+  root others can write to. This matters most on Windows, where OpenSSH gives
+  administrators an elevated token, and a workspace on a secondary drive
+  (`D:\xmat`) would otherwise inherit "Authenticated Users: Modify".
+- **Limit the desktop agent.** `xmat desktop` only runs step scripts from run
+  directories inside its own workspace.
+- **Strip terminal control sequences.** Everything printed on the
+  controller that originates on a host or in the commit (errors, log tails,
+  logs) has them removed, so a build cannot redraw the matrix or write your
+  clipboard (OSC 52). Use `xmat log --raw` to see a log byte for byte.
+- **Stop the whole tree.** Timeouts and Ctrl-C stop every process a step
+  started before the target's lock is released:
+  - SIGTERM, then SIGKILL, to the step's process group;
+  - on Linux, a child subreaper also catches processes that escaped with
+    `setsid()`;
+  - on Windows, a Job Object catches detached grandchildren.
+- **Validate config.** Config files are parsed with size (1 MiB) and nesting
+  limits. Unknown keys are rejected, and so are values that git or ssh would
+  read as options.
+- **Warn about secrets.** `--dirty` lists the untracked files it will copy to
+  the hub and every host, and warns loudly about names that look like
+  secrets (`.env`, `*.pem`, `id_*`, ...).
+- **Minimal supply chain.** The code uses the standard library only, and
+  release binaries carry build provenance you can check with
+  `gh attestation verify xmat-linux-amd64 -R jm2/xmat`.
+
+**Recommended setup:**
+
+- **A dedicated host account.** Run hosts under their own account (say
+  `xmat`), not your everyday one, especially on a laptop with your browser
+  sessions, keychain and other keys. A malicious commit then owns that
+  account, not you.
+- **A separate hub account.** Give the hub its own account whose login shell
+  is `git-shell`. Every build host holds a key to the hub; if that key logs
+  into your own account on the hub machine, compromising any one host gives
+  a shell there.
+- **A dedicated controller key.** Use one key for controller-to-host access
+  and mark it `restrict` in each host's `authorized_keys`, which disables
+  forwarding and PTYs:
+  `restrict ssh-ed25519 AAAA... xmat-controller`.
+- **Agents.** An agent that may call `xmat run` can execute code on every
+  host. That is the point, but it also means a prompt-injected agent can.
+  Keep `.xmat.toml` changes in review, and do not point xmat at branches you
+  have not read.
+
+**Known limits:**
+
+- On macOS there is no subreaper, so a process that daemonizes with
+  `setsid()` can outlive a cancelled step.
+- Hosts report their own results; a compromised host can lie about them.
 
 ## Non-goals
 

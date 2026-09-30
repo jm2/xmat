@@ -23,9 +23,10 @@ func cmdLog(args []string) int {
 	tail := fs.Int("tail", 100, "print only the last N lines (0 = whole log)")
 	fs.IntVar(tail, "n", 100, "shorthand for --tail")
 	grep := fs.String("grep", "", "print only lines containing this text (case-insensitive)")
+	raw := fs.Bool("raw", false, "print the log byte-for-byte (by default terminal control sequences are stripped)")
 	fleetPath := fs.String("fleet", "", "fleet config path")
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `usage: xmat log [flags] <target> [<step>]
+		fmt.Fprint(stderr, `usage: xmat log [flags] <target> [<step>]
 
 Print a step's log from the last `+"`xmat run`"+` in this repository. Without <step>,
 prints the first step that did not pass (or the last step that ran).
@@ -44,21 +45,21 @@ prints the first step that did not pass (or the last step that ran).
 	defer stop()
 	repo, err := findRepo(ctx)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "xmat log:", err)
+		fmt.Fprintln(stderr, "xmat log:", err)
 		return exitUsage
 	}
 	lr, err := loadLastRun(repo)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "xmat log:", err)
+		fmt.Fprintln(stderr, "xmat log:", err)
 		return exitUsage
 	}
 	res := lr.Results[pos[0]]
 	if res == nil {
-		fmt.Fprintf(os.Stderr, "xmat log: target %q was not part of run %s (targets: %s)\n", pos[0], lr.RunID, strings.Join(lr.Targets, ", "))
+		fmt.Fprintf(stderr, "xmat log: target %q was not part of run %s (targets: %s)\n", pos[0], lr.RunID, strings.Join(lr.Targets, ", "))
 		return exitUsage
 	}
 	if res.Status == StError {
-		fmt.Fprintf(os.Stderr, "xmat log: %s never ran any steps: %s\n", res.Target, res.Error)
+		fmt.Fprintf(stderr, "xmat log: %s never ran any steps: %s\n", res.Target, res.Error)
 		return exitFailed
 	}
 	step := ""
@@ -81,13 +82,13 @@ prints the first step that did not pass (or the last step that ran).
 		}
 	}
 	if sr == nil || sr.Log == "" {
-		fmt.Fprintf(os.Stderr, "xmat log: no log for step %q on %s\n", step, res.Target)
+		fmt.Fprintf(stderr, "xmat log: no log for step %q on %s\n", step, res.Target)
 		return exitUsage
 	}
 
 	fleet, tr, err := targetTransport(*fleetPath, res.Target)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "xmat log:", err)
+		fmt.Fprintln(stderr, "xmat log:", err)
 		return exitUsage
 	}
 	req := FileRequest{Proto: Proto, Root: fleet.Targets[res.Target].Root, Repo: lr.Repo, RunID: lr.RunID,
@@ -95,15 +96,21 @@ prints the first step that did not pass (or the last step that ran).
 	if *grep != "" {
 		req.Tail = 0
 	}
-	var out io.Writer = os.Stdout
+	// Logs are written by commit-controlled code; strip control sequences
+	// unless asked not to.
+	body := stdout
+	if *raw {
+		body = os.Stdout
+	}
+	out := body
 	var gw *grepWriter
 	if *grep != "" {
-		gw = &grepWriter{needle: strings.ToLower(*grep), w: os.Stdout, max: *tail}
+		gw = &grepWriter{needle: strings.ToLower(*grep), w: body, max: *tail}
 		out = gw
 	}
-	fmt.Fprintf(os.Stderr, "== %s %s (%s, exit %d) %s\n", res.Target, sr.Name, sr.Status, sr.Exit, lr.RunID)
+	fmt.Fprintf(stderr, "== %s %s (%s, exit %d) %s\n", res.Target, sr.Name, sr.Status, sr.Exit, lr.RunID)
 	if err := tr.call(ctx, "host-file", req, out); err != nil {
-		fmt.Fprintln(os.Stderr, "xmat log:", err)
+		fmt.Fprintln(stderr, "xmat log:", err)
 		return exitInfra
 	}
 	if gw != nil {
@@ -158,7 +165,7 @@ func cmdGet(args []string) int {
 	outPath := fs.String("o", "", "write to this path (default: ./<basename>; '-' for stdout)")
 	fleetPath := fs.String("fleet", "", "fleet config path")
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `usage: xmat get [-o path] <target> <path>
+		fmt.Fprint(stderr, `usage: xmat get [-o path] <target> <path>
 
 Download a file from a target's run directory of the last run, e.g. an
 artifact listed in the matrix (artifacts/smoke/smoke.png) or result.json.
@@ -177,21 +184,21 @@ artifact listed in the matrix (artifacts/smoke/smoke.png) or result.json.
 	defer stop()
 	repo, err := findRepo(ctx)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "xmat get:", err)
+		fmt.Fprintln(stderr, "xmat get:", err)
 		return exitUsage
 	}
 	lr, err := loadLastRun(repo)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "xmat get:", err)
+		fmt.Fprintln(stderr, "xmat get:", err)
 		return exitUsage
 	}
 	if lr.Results[pos[0]] == nil {
-		fmt.Fprintf(os.Stderr, "xmat get: target %q was not part of run %s\n", pos[0], lr.RunID)
+		fmt.Fprintf(stderr, "xmat get: target %q was not part of run %s\n", pos[0], lr.RunID)
 		return exitUsage
 	}
 	fleet, tr, err := targetTransport(*fleetPath, pos[0])
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "xmat get:", err)
+		fmt.Fprintln(stderr, "xmat get:", err)
 		return exitUsage
 	}
 	dest := *outPath
@@ -202,7 +209,7 @@ artifact listed in the matrix (artifacts/smoke/smoke.png) or result.json.
 	var f *os.File
 	if dest != "-" {
 		if f, err = os.Create(dest + ".part"); err != nil {
-			fmt.Fprintln(os.Stderr, "xmat get:", err)
+			fmt.Fprintln(stderr, "xmat get:", err)
 			return exitUsage
 		}
 		w = f
@@ -214,11 +221,11 @@ artifact listed in the matrix (artifacts/smoke/smoke.png) or result.json.
 		if err != nil {
 			os.Remove(dest + ".part")
 		} else if err = os.Rename(dest+".part", dest); err == nil {
-			fmt.Fprintln(os.Stderr, "wrote", dest)
+			fmt.Fprintln(stderr, "wrote", dest)
 		}
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "xmat get:", err)
+		fmt.Fprintln(stderr, "xmat get:", err)
 		return exitInfra
 	}
 	return exitOK
@@ -292,7 +299,7 @@ func runFilePath(req FileRequest) (string, error) {
 		return "", errors.New("path must be relative to the run directory")
 	}
 	clean := filepath.Clean(rel)
-	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+	if !filepath.IsLocal(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return "", errors.New("path escapes the run directory")
 	}
 	root, err := hostRoot(req.Root)

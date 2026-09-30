@@ -22,8 +22,10 @@ import (
 // Remote hosts are simulated with a fake ssh that runs the command locally.
 
 const fakeSSH = `#!/bin/sh
-# fake ssh: <host> <command>; runs the command locally, like a remote login shell would.
+# fake ssh: <host> <command>; runs the command locally, like a remote login
+# shell would, including the variables sshd sets and a (fake) forwarded agent.
 host="$1"; shift
+export SSH_CONNECTION="10.0.0.1 50000 10.0.0.2 22" SSH_AUTH_SOCK=/tmp/fake-forwarded-agent
 exec sh -c "$1"
 `
 
@@ -288,7 +290,7 @@ sleep 60
 		var pidFile string
 		deadline := time.Now().Add(20 * time.Second)
 		for pidFile == "" {
-			m, _ := filepath.Glob(filepath.Join(e.roots[target], "repos", "demo", "runs", "*", "pid"))
+			m, _ := filepath.Glob(filepath.Join(e.roots[target], "repos", "demo", "runs", target, "*", "pid"))
 			if len(m) > 0 {
 				if data, _ := os.ReadFile(m[0]); len(bytes.TrimSpace(data)) > 0 {
 					pidFile = m[0]
@@ -354,4 +356,128 @@ func groupAlive(pgid int) bool {
 		}
 	}
 	return false
+}
+
+func TestTimeoutKillsStubbornDescendants(t *testing.T) {
+	e := newEnv(t, `
+[step.hang]
+timeout = "2s"
+run = '''
+sh -c 'trap "" TERM; echo $$ > "$XMAT_RUN_DIR/trapper"; while :; do sleep 1; done' &
+setsid sh -c 'echo $$ > "$XMAT_RUN_DIR/escaper"; exec sleep 60' &
+sleep 60
+'''
+`)
+	for _, target := range []string{"linux-a", "linux-b"} {
+		out, errOut, code := e.xmat(nil, "run", "-t", target)
+		if code != exitFailed || !strings.Contains(out, "TIMEOUT") {
+			t.Fatalf("%s: exit %d\n%s\n%s", target, code, out, errOut)
+		}
+		names := []string{"trapper"}
+		if runtime.GOOS == "linux" {
+			names = append(names, "escaper") // setsid escapes are only caught with a subreaper
+		}
+		for _, name := range names {
+			m, _ := filepath.Glob(filepath.Join(e.roots[target], "repos", "demo", "runs", target, "*", name))
+			if len(m) != 1 {
+				t.Fatalf("%s: %s pid file not found", target, name)
+			}
+			data, _ := os.ReadFile(m[0])
+			var pid int
+			fmt.Sscan(string(data), &pid)
+			if processAlive(pid) {
+				t.Errorf("%s: %s (pid %d) survived the timeout", target, name, pid)
+				syscallKill(pid, 9)
+			}
+			os.Remove(m[0])
+		}
+	}
+}
+
+// processAlive reports whether pid exists and is not a zombie.
+func processAlive(pid int) bool {
+	if runtime.GOOS != "linux" {
+		time.Sleep(time.Second) // let init reap it
+		return syscall.Kill(pid, 0) == nil
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return false
+	}
+	s := string(data)
+	i := strings.LastIndexByte(s, ')')
+	return i >= 0 && !strings.HasPrefix(strings.TrimSpace(s[i+1:]), "Z")
+}
+
+func TestStepEnvironmentHygiene(t *testing.T) {
+	e := newEnv(t, `
+[step.env]
+run = '''
+echo "sock=${SSH_AUTH_SOCK:-none}"
+if [ -r /proc/self/status ]; then echo "sigign=$(awk '/^SigIgn/ {print $2}' /proc/self/status)"; fi
+'''
+`)
+	out, errOut, code := e.xmat(nil, "run", "-t", "linux-b")
+	if code != exitOK {
+		t.Fatalf("exit %d\n%s\n%s", code, out, errOut)
+	}
+	log, _, _ := e.xmat(nil, "log", "linux-b", "env")
+	if !strings.Contains(log, "sock=none") {
+		t.Errorf("forwarded agent socket reached the step:\n%s", log)
+	}
+	if i := strings.Index(log, "sigign="); i >= 0 {
+		var mask uint64
+		fmt.Sscanf(log[i+len("sigign="):], "%x", &mask)
+		if mask&(1<<(2-1)) != 0 {
+			t.Errorf("steps inherit an ignored SIGINT (SigIgn=%x)", mask)
+		}
+	}
+}
+
+func TestHostileOutputIsSanitized(t *testing.T) {
+	e := newEnv(t, `
+[step.build]
+run = '''
+printf 'src/x.c:1:1: error: \033]52;c;SGVsbG8=\007pwned \033[1A\033[2Kok\n'
+exit 1
+'''
+`)
+	out, errOut, code := e.xmat(nil, "run", "-t", "linux-a")
+	if code != exitFailed {
+		t.Fatalf("exit %d\n%s\n%s", code, out, errOut)
+	}
+	for _, s := range []string{out, errOut} {
+		if strings.ContainsAny(s, "\x1b\x07") {
+			t.Errorf("control characters reached the terminal: %q", s)
+		}
+	}
+	expectContains(t, "matrix", out, "src/x.c:1:1: error: pwned ok")
+	log, _, _ := e.xmat(nil, "log", "linux-a", "build")
+	if strings.ContainsAny(log, "\x1b\x07") {
+		t.Errorf("xmat log leaked control characters: %q", log)
+	}
+	raw, _, _ := e.xmat(nil, "log", "--raw", "linux-a", "build")
+	if !strings.Contains(raw, "\x1b]52") {
+		t.Errorf("--raw should keep the log byte-for-byte: %q", raw)
+	}
+}
+
+func TestHostRejectsBadJobs(t *testing.T) {
+	e := newEnv(t, demoCfg)
+	head := e.git("rev-parse", "HEAD")
+	for name, c := range map[string]struct{ job, want string }{
+		"option sha": {`{"proto":1,"repo":"demo","sha":"--help","target":"linux-a","run_id":"r1","hub_fetch":"/x"}`, "invalid commit id"},
+		"short sha":  {`{"proto":1,"repo":"demo","sha":"abc123","target":"linux-a","run_id":"r1","hub_fetch":"/x"}`, "invalid commit id"},
+		"option hub": {`{"proto":1,"repo":"demo","sha":"` + head + `","target":"linux-a","run_id":"r1","hub_fetch":"--upload-pack=touch /tmp/x"}`, "invalid hub URL"},
+		"repo path":  {`{"proto":1,"repo":"../demo","sha":"` + head + `","target":"linux-a","run_id":"r1","hub_fetch":"/x"}`, "invalid name"},
+	} {
+		job := c.job
+		cmd := exec.Command(xmatBin, "host")
+		cmd.Env = append(append([]string{}, e.vars...), "XMAT_ROOT="+filepath.Join(e.dir, "hostroot"))
+		cmd.Stdin = strings.NewReader(job + "\n")
+		out, _ := cmd.Output()
+		if !strings.Contains(string(out), `"status":"error"`) || !strings.Contains(string(out), c.want) {
+			t.Errorf("%s: host did not refuse the job with %q: %s", name, c.want, out)
+		}
+	}
 }

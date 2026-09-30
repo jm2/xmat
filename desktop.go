@@ -154,6 +154,10 @@ func cmdDesktop(args []string) int {
 		printAutostart(*root)
 		return 0
 	}
+	if err := ensureRoot(r); err != nil {
+		fmt.Fprintln(os.Stderr, "xmat desktop:", err)
+		return 1
+	}
 	spool := spoolDir(r)
 	if err := os.MkdirAll(spool, 0o700); err != nil {
 		fmt.Fprintln(os.Stderr, "xmat desktop:", err)
@@ -208,12 +212,12 @@ func cmdDesktop(args []string) int {
 			if os.Rename(filepath.Join(spool, name), claimed) != nil {
 				continue // withdrawn or taken
 			}
-			go serveDesktopJob(ctx, spool, id, claimed)
+			go serveDesktopJob(ctx, r, spool, id, claimed)
 		}
 	}
 }
 
-func serveDesktopJob(ctx context.Context, spool, id, claimed string) {
+func serveDesktopJob(ctx context.Context, root, spool, id, claimed string) {
 	finish := func(d deskDone) {
 		data, _ := json.Marshal(d)
 		_ = writeFileAtomic(filepath.Join(spool, id+".done"), data)
@@ -228,6 +232,11 @@ func serveDesktopJob(ctx context.Context, spool, id, claimed string) {
 	var job deskJob
 	if err := json.Unmarshal(data, &job); err != nil || len(job.Argv) == 0 {
 		finish(deskDone{Exit: -1, Error: "malformed job"})
+		return
+	}
+	if err := checkDeskJob(root, &job); err != nil {
+		fmt.Fprintln(os.Stderr, "xmat desktop: rejected job:", err)
+		finish(deskDone{Exit: -1, Error: "rejected: " + err.Error()})
 		return
 	}
 	fmt.Fprintf(os.Stderr, "xmat desktop: running %s in %s\n", strings.Join(job.Argv, " "), job.Dir)
@@ -332,4 +341,33 @@ user manager (GNOME and KDE do). Without systemd, add "%s desktop%s" to your
 session's autostart instead.
 `, exe, rootArg, exe, rootArg)
 	}
+}
+
+var deskShells = map[string]bool{"sh": true, "bash": true, "cmd.exe": true, "pwsh": true, "powershell": true}
+
+// checkDeskJob accepts only what `xmat host` itself submits: a known shell
+// running a step script from a run directory under this root, with its log
+// there too. The spool is private to the user; this keeps the agent from
+// being a general "run anything in my desktop session" service even so.
+func checkDeskJob(root string, job *deskJob) error {
+	repos := filepath.Join(root, "repos")
+	if !deskShells[job.Argv[0]] {
+		return fmt.Errorf("unexpected program %q", job.Argv[0])
+	}
+	script := job.Argv[len(job.Argv)-1]
+	switch strings.ToLower(filepath.Ext(script)) {
+	case ".sh", ".cmd", ".ps1":
+	default:
+		return fmt.Errorf("unexpected script %q", script)
+	}
+	if !within(repos, script) || filepath.Base(filepath.Dir(script)) != "scripts" {
+		return fmt.Errorf("script %q is not in a run directory", script)
+	}
+	if !within(repos, job.Log) || filepath.Ext(job.Log) != ".log" {
+		return fmt.Errorf("log %q is not in a run directory", job.Log)
+	}
+	if !within(repos, job.Dir) {
+		return fmt.Errorf("directory %q is not under the workspace", job.Dir)
+	}
+	return nil
 }

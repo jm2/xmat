@@ -168,3 +168,21 @@ func TestErrorPosition(t *testing.T) {
 		t.Fatalf("want error on line 3, got %v", err)
 	}
 }
+
+func TestHostileInput(t *testing.T) {
+	deep := "a = " + strings.Repeat("[", 100000) + strings.Repeat("]", 100000)
+	if _, err := Parse(deep); err == nil || !strings.Contains(err.Error(), "nested") {
+		t.Errorf("deep nesting: %v", err)
+	}
+	deepInline := "a = " + strings.Repeat("{b = ", 1000) + "1" + strings.Repeat("}", 1000)
+	if _, err := Parse(deepInline); err == nil {
+		t.Error("deep inline tables accepted")
+	}
+	ok := "a = " + strings.Repeat("[", 30) + strings.Repeat("]", 30)
+	if _, err := Parse(ok); err != nil {
+		t.Errorf("30 levels should parse: %v", err)
+	}
+	if _, err := Parse("# " + strings.Repeat("x", MaxSize)); err == nil {
+		t.Error("oversized input accepted")
+	}
+}

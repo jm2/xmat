@@ -91,6 +91,9 @@ func initRemoteHub(ctx context.Context, sshCmd []string, hubURL string) error {
 	if err != nil {
 		return err
 	}
+	if strings.HasPrefix(dest, "-") {
+		return fmt.Errorf("refusing hub ssh destination %q", dest)
+	}
 	if strings.ContainsAny(path, "'\n") {
 		return fmt.Errorf("refusing to create hub at unusual path %q", path)
 	}

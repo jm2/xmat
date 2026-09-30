@@ -53,6 +53,11 @@ func main() {
 		os.Exit(exitUsage)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
+	switch cmd {
+	case "run", "log", "logs", "get", "doctor", "init":
+		// These print text that originates on build hosts or in the commit.
+		filterOutput()
+	}
 	var code int
 	switch cmd {
 	case "run":
@@ -78,7 +83,7 @@ func main() {
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 	default:
-		fmt.Fprintf(os.Stderr, "xmat: unknown command %q\n\n%s", cmd, usage)
+		fmt.Fprintf(os.Stderr, "xmat: unknown command %q\n\n%s", sanitize(cmd), usage)
 		code = exitUsage
 	}
 	os.Exit(code)

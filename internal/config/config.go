@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -59,8 +60,12 @@ type Target struct {
 	Arch     string // expected GOARCH ("" = any)
 }
 
-// DefaultSSH is used when the fleet file sets no [ssh] command.
-var DefaultSSH = []string{"ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"}
+// DefaultSSH is used when the fleet file sets no [ssh] command. It disables
+// agent, X11 and port forwarding: build steps run code from the commit under
+// test, and must not be able to borrow the controller's ssh agent to reach
+// other machines.
+var DefaultSSH = []string{"ssh", "-T", "-a", "-x", "-o", "ClearAllForwardings=yes",
+	"-o", "BatchMode=yes", "-o", "ConnectTimeout=15"}
 
 // FleetSearchPaths lists where the fleet file is looked for, in order.
 func FleetSearchPaths() []string {
@@ -165,6 +170,11 @@ func ParseFleet(src string) (*Fleet, error) {
 	if f.HubFetch == "" {
 		f.HubFetch = f.HubPush
 	}
+	for _, u := range []string{f.HubPush, f.HubFetch} {
+		if err := checkArg("hub URL", u); err != nil {
+			return nil, err
+		}
+	}
 
 	if s, ok, err := v.table("ssh"); err != nil {
 		return nil, err
@@ -227,6 +237,11 @@ func ParseFleet(src string) (*Fleet, error) {
 		if err := tv.done(); err != nil {
 			return nil, err
 		}
+		for what, val := range map[string]string{"host": t.Host, "hub_fetch": t.HubFetch, "xmat": t.Xmat} {
+			if err := checkArg(fmt.Sprintf("[target.%s] %s", name, what), val); err != nil {
+				return nil, err
+			}
+		}
 		if !t.Local && t.Host == "" {
 			return nil, fmt.Errorf("[target.%s] needs host = \"<ssh destination>\" (or local = true)", name)
 		}
@@ -240,6 +255,17 @@ func ParseFleet(src string) (*Fleet, error) {
 		return nil, err
 	}
 	return f, nil
+}
+
+// checkArg rejects values that git or ssh would parse as options.
+func checkArg(what, v string) error {
+	if strings.HasPrefix(v, "-") {
+		return fmt.Errorf("%s %q must not start with '-'", what, v)
+	}
+	if strings.ContainsAny(v, "\x00\n\r") {
+		return fmt.Errorf("%s contains a control character", what)
+	}
+	return nil
 }
 
 // HubFetchFor returns the URL target t fetches repo from.
@@ -732,7 +758,7 @@ func (v *tview) done() error {
 	var unknown []string
 	for _, k := range v.t.Keys() {
 		if !v.used[k] {
-			unknown = append(unknown, v.name(k))
+			unknown = append(unknown, strconv.Quote(v.name(k)))
 		}
 	}
 	if len(unknown) == 0 {

@@ -56,7 +56,10 @@ Write-Output "should not get here"
 [step.hang]
 default = false
 timeout = "3s"
-run = "ping -n 60 127.0.0.1 >nul"
+run = '''
+start "" /b ping -n 60 127.0.0.2 >nul
+ping -n 60 127.0.0.1 >nul
+'''
 
 [step.smoke]
 default = false
@@ -128,6 +131,12 @@ func TestWindowsTimeout(t *testing.T) {
 		t.Errorf("timeout took %s", d)
 	}
 	expectContains(t, "matrix", out, "TIMEOUT")
+	// The detached grandchild must be gone too (Job Object, not just taskkill /T).
+	time.Sleep(time.Second)
+	list, _ := exec.Command("tasklist", "/FI", "IMAGENAME eq PING.EXE", "/NH").Output()
+	if strings.Contains(strings.ToUpper(string(list)), "PING.EXE") {
+		t.Errorf("ping.exe survived the timeout:\n%s", list)
+	}
 }
 
 func TestWindowsDesktopAgent(t *testing.T) {

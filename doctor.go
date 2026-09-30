@@ -28,7 +28,7 @@ func cmdDoctor(args []string) int {
 	targetsF := fs.String("targets", "", "comma-separated targets (default: all)")
 	fleetPath := fs.String("fleet", "", "fleet config path")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: xmat doctor [--targets a,b]\n\nCheck ssh reachability, xmat and git on each host, hub access and desktop agents.")
+		fmt.Fprintln(stderr, "usage: xmat doctor [--targets a,b]\n\nCheck ssh reachability, xmat and git on each host, hub access and desktop agents.")
 		fs.PrintDefaults()
 	}
 	if _, err := parseInterspersed(fs, args); err != nil {
@@ -38,10 +38,10 @@ func cmdDoctor(args []string) int {
 	defer stop()
 	fleet, err := config.FindFleet(*fleetPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "xmat doctor:", err)
+		fmt.Fprintln(stderr, "xmat doctor:", err)
 		return exitUsage
 	}
-	fmt.Printf("fleet: %s\n", fleet.Path)
+	fmt.Fprintf(stdout, "fleet: %s\n", fleet.Path)
 
 	// Hub checks need a repo name; use the current repository if there is one.
 	repoName := ""
@@ -49,7 +49,7 @@ func cmdDoctor(args []string) int {
 		repoName = filepath.Base(repo.top)
 		if text, err := os.ReadFile(filepath.Join(repo.top, config.RepoFile)); err == nil {
 			if rc, err := config.ParseRepo(string(text)); err != nil {
-				fmt.Printf("%s: %v\n", config.RepoFile, err)
+				fmt.Fprintf(stdout, "%s: %v\n", config.RepoFile, err)
 			} else if rc.Name != "" {
 				repoName = rc.Name
 			}
@@ -57,9 +57,9 @@ func cmdDoctor(args []string) int {
 	}
 	if repoName != "" {
 		push := fleet.HubPushFor(repoName)
-		fmt.Printf("hub (push): %s ... %s\n", push, hubState(ctx, push))
+		fmt.Fprintf(stdout, "hub (push): %s ... %s\n", push, hubState(ctx, push))
 	} else {
-		fmt.Println("hub: run doctor inside a repository to check hub access for it")
+		fmt.Fprintln(stdout, "hub: run doctor inside a repository to check hub access for it")
 	}
 
 	targets := splitList(*targetsF)
@@ -100,7 +100,7 @@ func cmdDoctor(args []string) int {
 	}
 	wg.Wait()
 
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "\nTARGET\tHOST\tXMAT\tOS/ARCH\tGIT\tHUB\tDESKTOP\tSHELLS")
 	problems := 0
 	var notes []string
@@ -138,7 +138,7 @@ func cmdDoctor(args []string) int {
 		}
 		if !in.RootOK {
 			problems++
-			notes = append(notes, fmt.Sprintf("%s: workspace root %s not writable: %s", r.name, in.Root, in.RootErr))
+			notes = append(notes, fmt.Sprintf("%s: %s", r.name, in.RootErr))
 		}
 		gitv := strings.TrimPrefix(in.Git, "git version ")
 		if gitv == "" {
@@ -156,9 +156,9 @@ func cmdDoctor(args []string) int {
 	}
 	tw.Flush()
 	if len(notes) > 0 {
-		fmt.Println()
+		fmt.Fprintln(stdout)
 		for _, n := range notes {
-			fmt.Println(n)
+			fmt.Fprintln(stdout, n)
 		}
 	}
 	if problems > 0 {
@@ -222,7 +222,7 @@ func cmdHostInfo(args []string) int {
 	root, err := hostRoot(req.Root)
 	in.Root = root
 	if err == nil {
-		err = os.MkdirAll(root, 0o755)
+		err = ensureRoot(root)
 	}
 	if err == nil {
 		probe := filepath.Join(root, ".xmat-write-test")

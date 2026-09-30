@@ -75,8 +75,8 @@ const fleetTemplate = `# xmat fleet: which build hosts exist and how to reach th
 push  = "ssh://you@antec/home/you/xmat-hub/{repo}.git"
 # fetch = "..."               # URL hosts use, if different from push
 
-# [ssh]
-# command = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+# [ssh]   # the default; keep forwarding disabled if you change it
+# command = ["ssh", "-T", "-a", "-x", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
 
 [target.linux-x64]
 host = "antec"                # anything ssh accepts, including ~/.ssh/config aliases
@@ -89,7 +89,7 @@ host = "antec-win"
 os = "windows"
 arch = "amd64"
 # xmat = 'C:\tools\xmat.exe'   # if xmat is not on PATH for ssh sessions
-# root = 'D:\xmat'             # workspace root on the host (default: ~/xmat)
+# root = 'D:\xmat'             # workspace root on the host (default: ~/xmat); xmat creates it private
 
 [target.mac-arm64]
 host = "mbp16-m1max"
@@ -107,7 +107,7 @@ func cmdInit(args []string) int {
 	fleet := fs.Bool("fleet", false, "write a fleet config instead of a repo config")
 	force := fs.Bool("force", false, "overwrite an existing file")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: xmat init [--fleet] [--force]\n\nWrite a commented starter .xmat.toml at the repository root, or with\n--fleet a starter fleet config.")
+		fmt.Fprintln(stderr, "usage: xmat init [--fleet] [--force]\n\nWrite a commented starter .xmat.toml at the repository root, or with\n--fleet a starter fleet config.")
 		fs.PrintDefaults()
 	}
 	if _, err := parseInterspersed(fs, args); err != nil {
@@ -121,23 +121,23 @@ func cmdInit(args []string) int {
 		defer stop()
 		repo, err := findRepo(ctx)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "xmat init:", err)
+			fmt.Fprintln(stderr, "xmat init:", err)
 			return exitUsage
 		}
 		path, body = filepath.Join(repo.top, config.RepoFile), repoTemplate
 	}
 	if _, err := os.Stat(path); err == nil && !*force {
-		fmt.Fprintf(os.Stderr, "xmat init: %s already exists (use --force to overwrite)\n", path)
+		fmt.Fprintf(stderr, "xmat init: %s already exists (use --force to overwrite)\n", path)
 		return exitUsage
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		fmt.Fprintln(os.Stderr, "xmat init:", err)
+		fmt.Fprintln(stderr, "xmat init:", err)
 		return exitUsage
 	}
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-		fmt.Fprintln(os.Stderr, "xmat init:", err)
+		fmt.Fprintln(stderr, "xmat init:", err)
 		return exitUsage
 	}
-	fmt.Println("wrote", path)
+	fmt.Fprintln(stdout, "wrote", path)
 	return exitOK
 }

@@ -67,6 +67,9 @@ func TestFleetErrors(t *testing.T) {
 		"bad name":    "[hub]\npush = \"/x\"\n[target.\"a b\"]\nhost = \"x\"",
 		"wrong type":  "[hub]\npush = 5\n[target.a]\nhost = \"x\"",
 		"empty ssh":   "[hub]\npush = \"/x\"\n[ssh]\ncommand = []\n[target.a]\nhost = \"x\"",
+		"option host": "[hub]\npush = \"/x\"\n[target.a]\nhost = \"-oProxyCommand=evil\"",
+		"option hub":  "[hub]\npush = \"--upload-pack=evil\"\n[target.a]\nhost = \"x\"",
+		"option hubf": "[hub]\npush = \"/x\"\n[target.a]\nhost = \"x\"\nhub_fetch = \"-u evil\"",
 	}
 	for name, src := range cases {
 		if _, err := ParseFleet(src); err == nil {

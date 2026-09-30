@@ -108,9 +108,11 @@ func stepEnv(repoEnv, step map[string]string, xmat map[string]string) []string {
 	return out
 }
 
-// execLogged runs argv in dir with its combined output appended to logPath.
+// execLogged runs argv in dir with its combined output written to logPath.
+// On cancellation the whole process tree is stopped before it returns, so a
+// run never releases its lock while pieces of the build are still running.
 func execLogged(ctx context.Context, argv []string, dir string, env []string, logPath string) (int, error) {
-	logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return -1, err
 	}
@@ -120,25 +122,41 @@ func execLogged(ctx context.Context, argv []string, dir string, env []string, lo
 	cmd.Env = env
 	cmd.Stdin = nil
 	cmd.Stdout, cmd.Stderr = logf, logf
-	prepareCmd(cmd)
-	if err := cmd.Start(); err != nil {
+	tree, err := startTree(cmd)
+	if err != nil {
 		fmt.Fprintf(logf, "xmat: cannot start %s: %v\n", argv[0], err)
 		return -1, err
 	}
+	defer tree.release()
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	select {
 	case err := <-done:
 		return exitCode(err), nil
 	case <-ctx.Done():
-		_ = killTree(cmd)
+	}
+
+	tree.terminate()
+	var werr error
+	exited := false
+	select {
+	case werr = <-done:
+		exited = true
+	case <-time.After(5 * time.Second):
+	}
+	// Always escalate: descendants may ignore SIGTERM or outlive the shell.
+	tree.kill()
+	if !exited {
 		select {
-		case err := <-done:
-			return exitCode(err), ctx.Err()
-		case <-time.After(15 * time.Second):
-			return -1, ctx.Err()
+		case werr = <-done:
+			exited = true
+		case <-time.After(10 * time.Second):
 		}
 	}
+	if !exited {
+		return -1, ctx.Err()
+	}
+	return exitCode(werr), ctx.Err()
 }
 
 func exitCode(err error) int {

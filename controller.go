@@ -7,6 +7,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,12 +17,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"text/tabwriter"
 	"time"
 
 	"github.com/jm2/xmat/internal/config"
+	"github.com/jm2/xmat/internal/tomlx"
 )
 
 // Exit codes of `xmat run`.
@@ -95,7 +100,9 @@ type lastRun struct {
 	Results  map[string]*TargetResult `json:"results"`
 }
 
-func lastRunPath(r *repoInfo) string { return filepath.Join(r.common, "xmat", "last-run.json") }
+// lastRunPath is per worktree, so agents working in different worktrees of
+// one repository do not overwrite each other's results.
+func lastRunPath(r *repoInfo) string { return filepath.Join(r.gitDir, "xmat", "last-run.json") }
 
 func loadLastRun(r *repoInfo) (*lastRun, error) {
 	data, err := os.ReadFile(lastRunPath(r))
@@ -120,7 +127,7 @@ func (p *progress) printf(target, format string, a ...any) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	fmt.Fprintf(os.Stderr, "[%s] %s\n", target, fmt.Sprintf(format, a...))
+	fmt.Fprintf(stderr, "[%s] %s\n", target, fmt.Sprintf(format, a...))
 }
 
 func splitList(s string) []string {
@@ -144,14 +151,14 @@ func cmdRun(args []string) int {
 	quiet := fs.Bool("q", false, "no progress lines on stderr")
 	fleetPath := fs.String("fleet", "", "fleet config (default: $XMAT_FLEET or ~/.config/xmat/fleet.toml)")
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `usage: xmat run [flags] [<commit-ish>]
+		fmt.Fprint(stderr, `usage: xmat run [flags] [<commit-ish>]
 
 Build and test one commit on every target in parallel and print a compact
 pass/fail matrix. Defaults to HEAD; with --dirty, to the working tree.
 
 `)
 		fs.PrintDefaults()
-		fmt.Fprint(os.Stderr, `
+		fmt.Fprint(stderr, `
 Exit status: 0 all passed, 1 a step failed, 2 usage/config error,
 3 a target could not run (unreachable host, hub, ...) but nothing failed.
 `)
@@ -165,7 +172,7 @@ Exit status: 0 all passed, 1 a step failed, 2 usage/config error,
 		return exitUsage
 	}
 	if len(pos) == 1 && *dirty {
-		fmt.Fprintln(os.Stderr, "xmat run: --dirty snapshots the working tree; it cannot be combined with a commit")
+		fmt.Fprintln(stderr, "xmat run: --dirty snapshots the working tree; it cannot be combined with a commit")
 		return exitUsage
 	}
 
@@ -174,12 +181,12 @@ Exit status: 0 all passed, 1 a step failed, 2 usage/config error,
 
 	repo, err := findRepo(ctx)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "xmat run:", err)
+		fmt.Fprintln(stderr, "xmat run:", err)
 		return exitUsage
 	}
 	fleet, err := config.FindFleet(*fleetPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "xmat run:", err)
+		fmt.Fprintln(stderr, "xmat run:", err)
 		return exitUsage
 	}
 
@@ -192,28 +199,31 @@ Exit status: 0 all passed, 1 a step failed, 2 usage/config error,
 	snap := false
 	if *dirty {
 		if sha, snap, err = snapshot(ctx, repo); err != nil {
-			fmt.Fprintln(os.Stderr, "xmat run: snapshot:", err)
+			fmt.Fprintln(stderr, "xmat run: snapshot:", err)
 			return exitUsage
+		}
+		if snap {
+			reportUntracked(ctx, repo, *quiet)
 		}
 		ref = "working tree"
 	} else {
 		if sha, err = git(ctx, repo.top, nil, "rev-parse", "--verify", "-q", ref+"^{commit}"); err != nil {
-			fmt.Fprintf(os.Stderr, "xmat run: %q is not a commit\n", ref)
+			fmt.Fprintf(stderr, "xmat run: %q is not a commit\n", ref)
 			return exitUsage
 		}
 		if len(pos) == 0 && worktreeDirty(ctx, repo) && !*quiet {
-			fmt.Fprintln(os.Stderr, "xmat: note: uncommitted changes are NOT included; building HEAD (use --dirty to include them)")
+			fmt.Fprintln(stderr, "xmat: note: uncommitted changes are NOT included; building HEAD (use --dirty to include them)")
 		}
 	}
 
-	cfgText, err := git(ctx, repo.top, nil, "show", sha+":"+config.RepoFile)
+	cfgText, err := showLimited(ctx, repo, sha+":"+config.RepoFile, tomlx.MaxSize)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "xmat run: %s is missing from %s (create one with `xmat init`, then commit it or use --dirty)\n", config.RepoFile, shortSHA(sha))
+		fmt.Fprintf(stderr, "xmat run: %s is missing from %s (create one with `xmat init`, then commit it or use --dirty)\n", config.RepoFile, shortSHA(sha))
 		return exitUsage
 	}
 	rcfg, err := config.ParseRepo(cfgText)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "xmat run: %s: %v\n", config.RepoFile, err)
+		fmt.Fprintf(stderr, "xmat run: %s: %v\n", config.RepoFile, err)
 		return exitUsage
 	}
 	repoName := rcfg.Name
@@ -221,7 +231,7 @@ Exit status: 0 all passed, 1 a step failed, 2 usage/config error,
 		repoName = filepath.Base(repo.top)
 	}
 	if !config.ValidName(repoName) {
-		fmt.Fprintf(os.Stderr, "xmat run: directory name %q is not a valid repo name; set name = \"...\" in %s\n", repoName, config.RepoFile)
+		fmt.Fprintf(stderr, "xmat run: directory name %q is not a valid repo name; set name = \"...\" in %s\n", repoName, config.RepoFile)
 		return exitUsage
 	}
 
@@ -234,30 +244,30 @@ Exit status: 0 all passed, 1 a step failed, 2 usage/config error,
 	}
 	for _, t := range targets {
 		if fleet.Targets[t] == nil {
-			fmt.Fprintf(os.Stderr, "xmat run: target %q is not in %s (known: %s)\n", t, fleet.Path, strings.Join(fleet.Order, ", "))
+			fmt.Fprintf(stderr, "xmat run: target %q is not in %s (known: %s)\n", t, fleet.Path, strings.Join(fleet.Order, ", "))
 			return exitUsage
 		}
 	}
 	explicit, with := splitList(*stepsF), splitList(*withF)
 	for _, n := range append(append([]string{}, explicit...), with...) {
 		if rcfg.Step(n) == nil {
-			fmt.Fprintf(os.Stderr, "xmat run: no step %q in %s (steps: %s)\n", n, config.RepoFile, strings.Join(rcfg.StepNames(), ", "))
+			fmt.Fprintf(stderr, "xmat run: no step %q in %s (steps: %s)\n", n, config.RepoFile, strings.Join(rcfg.StepNames(), ", "))
 			return exitUsage
 		}
 	}
 
 	prog := &progress{quiet: *quiet}
-	runID := time.Now().UTC().Format("20060102T150405Z") + "-" + sha[:8]
+	runID := time.Now().UTC().Format("20060102T150405Z") + "-" + sha[:8] + "-" + randomHex(3)
 	if !*quiet {
 		what := ref
 		if snap {
 			what = "working tree snapshot"
 		}
-		fmt.Fprintf(os.Stderr, "xmat: %s %s (%s) on %s\n", repoName, shortSHA(sha), what, strings.Join(targets, ", "))
+		fmt.Fprintf(stderr, "xmat: %s %s (%s) on %s\n", repoName, shortSHA(sha), what, strings.Join(targets, ", "))
 	}
 
 	if err := pushToHub(ctx, repo.top, fleet.SSH, fleet.HubPushFor(repoName), sha); err != nil {
-		fmt.Fprintln(os.Stderr, "xmat run: pushing to hub:", err)
+		fmt.Fprintln(stderr, "xmat run: pushing to hub:", err)
 		return exitInfra
 	}
 
@@ -284,16 +294,16 @@ Exit status: 0 all passed, 1 a step failed, 2 usage/config error,
 	}
 	lr.Steps = columns(rcfg, results)
 	if data, err := json.MarshalIndent(lr, "", "  "); err == nil {
-		_ = os.MkdirAll(filepath.Dir(lastRunPath(repo)), 0o755)
-		_ = os.WriteFile(lastRunPath(repo), data, 0o644)
+		_ = os.MkdirAll(filepath.Dir(lastRunPath(repo)), 0o700)
+		_ = os.WriteFile(lastRunPath(repo), data, 0o600)
 	}
 
 	if *jsonOut {
-		enc := json.NewEncoder(os.Stdout)
+		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(lr)
 	} else {
-		printMatrix(os.Stdout, lr, results)
+		printMatrix(stdout, lr, results)
 	}
 	if ctx.Err() != nil {
 		return 130
@@ -412,6 +422,7 @@ func runRemote(ctx context.Context, tr transport, job *Job, prog *progress) *Tar
 
 	if got != nil {
 		got.Host = tr.describe()
+		got.Target = job.Target // never let a host speak for another target
 		if got.Status == StError {
 			prog.printf(job.Target, "ERROR: %s", got.Error)
 		}
@@ -592,4 +603,55 @@ func printMatrix(w io.Writer, lr *lastRun, results []*TargetResult) {
 		}
 	}
 	fmt.Fprintf(w, "\n%d of %d targets passed.\n", passed, len(results))
+}
+
+// showLimited returns the contents of a blob, refusing ones over max bytes.
+func showLimited(ctx context.Context, r *repoInfo, spec string, max int) (string, error) {
+	size, err := git(ctx, r.top, nil, "cat-file", "-s", spec)
+	if err != nil {
+		return "", err
+	}
+	if n, err := strconv.Atoi(size); err != nil || n > max {
+		return "", fmt.Errorf("%s is larger than %d bytes", spec, max)
+	}
+	return git(ctx, r.top, nil, "cat-file", "blob", spec)
+}
+
+var secretLike = regexp.MustCompile(`(?i)(^|/)(\.env(\..*)?|.*\.(pem|key|p12|pfx|jks|keystore|kdbx)|id_(rsa|dsa|ecdsa|ed25519)(\.pub)?|\.netrc|\.npmrc|\.pypirc|credentials(\.json)?|.*secret.*)$`)
+
+// reportUntracked lists the untracked files a --dirty snapshot is about to
+// copy to the hub and every host, and warns loudly about secret-looking ones.
+func reportUntracked(ctx context.Context, r *repoInfo, quiet bool) {
+	out, err := git(ctx, r.top, nil, "ls-files", "--others", "--exclude-standard", "-z")
+	if err != nil || out == "" {
+		return
+	}
+	files := strings.Split(strings.TrimRight(out, "\x00"), "\x00")
+	var secrets []string
+	for _, f := range files {
+		if secretLike.MatchString(f) {
+			secrets = append(secrets, f)
+		}
+	}
+	if len(secrets) > 0 {
+		fmt.Fprintf(stderr, "xmat: WARNING: the snapshot includes untracked files that look like secrets and will be copied to the hub and every host: %s (add them to .gitignore)\n", strings.Join(secrets, ", "))
+	}
+	if quiet {
+		return
+	}
+	shown := files
+	if len(shown) > 8 {
+		shown = shown[:8]
+	}
+	more := ""
+	if len(files) > len(shown) {
+		more = fmt.Sprintf(" and %d more", len(files)-len(shown))
+	}
+	fmt.Fprintf(stderr, "xmat: snapshot includes %d untracked file(s): %s%s\n", len(files), strings.Join(shown, ", "), more)
+}
+
+func randomHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }

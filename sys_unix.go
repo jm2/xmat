@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
-	"time"
 )
 
 // fileLock is an advisory lock that the OS releases when the process exits,
@@ -39,22 +38,27 @@ func (l *fileLock) tryLock() (bool, error) {
 
 func (l *fileLock) close() { l.f.Close() }
 
-// prepareCmd puts the child in its own process group so a timeout can kill
-// the whole build tree (compilers, linkers, test binaries), not just the shell.
-func prepareCmd(cmd *exec.Cmd) {
+// procTree is a started step and everything it spawned. The step runs in its
+// own process group so a timeout can reach the whole build (compilers,
+// linkers, test binaries), not just the shell.
+type procTree struct{ pgid int }
+
+func startTree(cmd *exec.Cmd) (*procTree, error) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return &procTree{pgid: cmd.Process.Pid}, nil
 }
 
-// killTree terminates the process group started by cmd.
-func killTree(cmd *exec.Cmd) error {
-	if cmd.Process == nil {
-		return nil
-	}
-	pid := cmd.Process.Pid
-	_ = syscall.Kill(-pid, syscall.SIGTERM)
-	go func() {
-		time.Sleep(5 * time.Second)
-		_ = syscall.Kill(-pid, syscall.SIGKILL)
-	}()
-	return nil
+// terminate asks the whole group to stop.
+func (t *procTree) terminate() { _ = syscall.Kill(-t.pgid, syscall.SIGTERM) }
+
+// kill forcibly stops the group, plus (on Linux) anything that left the
+// group with setsid and was orphaned onto us.
+func (t *procTree) kill() {
+	_ = syscall.Kill(-t.pgid, syscall.SIGKILL)
+	killOrphans(t.pgid)
 }
+
+func (t *procTree) release() {}

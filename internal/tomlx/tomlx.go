@@ -57,14 +57,24 @@ func (e *Error) Error() string { return fmt.Sprintf("line %d, column %d: %s", e.
 const eof = rune(-1)
 
 type parser struct {
-	s    []rune
-	pos  int
-	root *Table
-	cur  *Table
+	s     []rune
+	pos   int
+	depth int
+	root  *Table
+	cur   *Table
 }
+
+// Limits for hostile input: config files come from commits.
+const (
+	MaxSize  = 1 << 20 // bytes
+	maxDepth = 32      // nested arrays / inline tables
+)
 
 // Parse parses src into an ordered table tree.
 func Parse(src string) (t *Table, err error) {
+	if len(src) > MaxSize {
+		return nil, &Error{Line: 1, Col: 1, Msg: fmt.Sprintf("file is larger than %d bytes", MaxSize)}
+	}
 	if !utf8.ValidString(src) {
 		return nil, &Error{Line: 1, Col: 1, Msg: "file is not valid UTF-8"}
 	}
@@ -343,7 +353,16 @@ func (p *parser) hasWord(w string) bool {
 	return !isBare(p.at(len(w)))
 }
 
+func (p *parser) nest() func() {
+	p.depth++
+	if p.depth > maxDepth {
+		p.fail("values nested more than %d levels deep", maxDepth)
+	}
+	return func() { p.depth-- }
+}
+
 func (p *parser) array() []any {
+	defer p.nest()()
 	p.pos++ // [
 	arr := []any{}
 	for {
@@ -367,6 +386,7 @@ func (p *parser) array() []any {
 }
 
 func (p *parser) inlineTable() *Table {
+	defer p.nest()()
 	p.pos++ // {
 	t := newTable()
 	for {

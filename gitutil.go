@@ -66,6 +66,7 @@ func gitStderr(err error) string {
 type repoInfo struct {
 	top    string // working tree root
 	common string // common git dir (shared by worktrees)
+	gitDir string // this worktree's git dir
 }
 
 func findRepo(ctx context.Context) (*repoInfo, error) {
@@ -83,7 +84,11 @@ func findRepo(ctx context.Context) (*repoInfo, error) {
 			common = filepath.Join(top, common)
 		}
 	}
-	return &repoInfo{top: filepath.FromSlash(top), common: filepath.FromSlash(common)}, nil
+	gitDir, err := git(ctx, top, nil, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		gitDir = common
+	}
+	return &repoInfo{top: filepath.FromSlash(top), common: filepath.FromSlash(common), gitDir: filepath.FromSlash(gitDir)}, nil
 }
 
 // snapshot commits the working tree (tracked changes plus untracked,

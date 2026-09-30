@@ -10,9 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -21,6 +23,7 @@ import (
 	"time"
 
 	"github.com/jm2/xmat/internal/config"
+	"github.com/jm2/xmat/internal/tomlx"
 )
 
 // Host-side layout under the root (default ~/xmat):
@@ -94,7 +97,15 @@ func cmdHost(args []string) int {
 		_, _ = io.Copy(io.Discard, in)
 		cancel()
 	}()
-	signal.Ignore(os.Interrupt)
+	// Handle (rather than ignore) SIGINT: an ignored disposition would be
+	// inherited by every step, which then could not be interrupted.
+	ints := make(chan os.Signal, 1)
+	signal.Notify(ints, os.Interrupt)
+	go func() {
+		for range ints {
+		}
+	}()
+	setSubreaper()
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
@@ -127,6 +138,12 @@ func runJob(ctx context.Context, em *emitter, job *Job, hostname string) *Target
 	if job.WantArch != "" && job.WantArch != runtime.GOARCH {
 		return fail(res, "target %s expects arch %s but %s runs %s", job.Target, job.WantArch, hostname, runtime.GOARCH)
 	}
+	if !shaRE.MatchString(job.SHA) {
+		return fail(res, "invalid commit id %q in job", job.SHA)
+	}
+	if job.HubFetch == "" || strings.HasPrefix(job.HubFetch, "-") {
+		return fail(res, "invalid hub URL %q in job", job.HubFetch)
+	}
 	for _, n := range []string{job.Repo, job.Target, job.RunID} {
 		if !config.ValidName(n) {
 			return fail(res, "invalid name %q in job", n)
@@ -136,8 +153,11 @@ func runJob(ctx context.Context, em *emitter, job *Job, hostname string) *Target
 	if err != nil {
 		return fail(res, "workspace root: %v", err)
 	}
+	if err := ensureRoot(root); err != nil {
+		return fail(res, "%v", err)
+	}
 	repoDir := filepath.Join(root, "repos", job.Repo)
-	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+	if err := os.MkdirAll(repoDir, 0o700); err != nil {
 		return fail(res, "creating %s: %v", repoDir, err)
 	}
 
@@ -180,14 +200,17 @@ func runJob(ctx context.Context, em *emitter, job *Job, hostname string) *Target
 	// Check the commit out into this target's persistent worktree.
 	wt := filepath.Join(repoDir, "wt", job.Target)
 	err = checkout(ctx, mirror, wt, job.SHA)
+	pruneMirrorRefs(ctx, mirror, 200)
 	mlock.close()
 	if err != nil {
 		return fail(res, "checkout: %v", err)
 	}
 
-	data, err := os.ReadFile(filepath.Join(wt, config.RepoFile))
-	if err != nil {
+	data, err := readLimited(filepath.Join(wt, config.RepoFile), tomlx.MaxSize)
+	if errors.Is(err, fs.ErrNotExist) {
 		return fail(res, "commit %s has no %s", shortSHA(job.SHA), config.RepoFile)
+	} else if err != nil {
+		return fail(res, "%v", err)
 	}
 	repoCfg, err := config.ParseRepo(string(data))
 	if err != nil {
@@ -231,8 +254,12 @@ func runJob(ctx context.Context, em *emitter, job *Job, hostname string) *Target
 	}
 
 	runDir := runDirFor(repoDir, job.RunID, job.Target)
-	if err := os.MkdirAll(runDir, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(runDir), 0o700); err != nil {
 		return fail(res, "%v", err)
+	}
+	// Mkdir, not MkdirAll: two runs must never share a run directory.
+	if err := os.Mkdir(runDir, 0o700); err != nil {
+		return fail(res, "creating run directory: %v", err)
 	}
 	res.RunDir = runDir
 	scriptDir := filepath.Join(runDir, "scripts")
@@ -283,8 +310,7 @@ func runJob(ctx context.Context, em *emitter, job *Job, hostname string) *Target
 	if data, err := json.MarshalIndent(res, "", "  "); err == nil {
 		_ = os.WriteFile(filepath.Join(runDir, "result.json"), data, 0o644)
 	}
-	pruneRuns(filepath.Join(repoDir, "runs"), job.Target, repoCfg.KeepRuns)
-	pruneMirrorRefs(ctx, mirror, 200)
+	pruneRuns(filepath.Dir(runDir), repoCfg.KeepRuns)
 	return res
 }
 
@@ -351,7 +377,7 @@ func runStep(ctx context.Context, root, wt, runDir, scriptDir string, st config.
 	if st.Desktop {
 		code, err = runDesktop(sctx, root, argv, dir, extraEnv, logPath, st.Timeout)
 	} else {
-		code, err = execLogged(sctx, argv, dir, append(os.Environ(), extraEnv...), logPath)
+		code, err = execLogged(sctx, argv, dir, append(stepBaseEnv(), extraEnv...), logPath)
 	}
 	sr.Exit = code
 	switch {
@@ -386,26 +412,57 @@ func runStep(ctx context.Context, root, wt, runDir, scriptDir string, st config.
 
 // runDirFor is where one target's results for one run live.
 func runDirFor(repoDir, runID, target string) string {
-	return filepath.Join(repoDir, "runs", runID+"-"+target)
+	return filepath.Join(repoDir, "runs", target, runID)
 }
 
-// pruneRuns keeps the newest keep run directories for target.
-func pruneRuns(runsDir, target string, keep int) {
-	entries, err := os.ReadDir(runsDir)
+// pruneRuns keeps the newest keep run directories in dir (one target's runs).
+func pruneRuns(dir string, keep int) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
-	var mine []string
+	var runs []string
 	for _, e := range entries {
-		if e.IsDir() && strings.HasSuffix(e.Name(), "-"+target) {
-			mine = append(mine, e.Name())
+		if e.IsDir() && config.ValidName(e.Name()) {
+			runs = append(runs, e.Name())
 		}
 	}
-	sort.Strings(mine) // run IDs start with a UTC timestamp
-	for len(mine) > keep {
-		os.RemoveAll(filepath.Join(runsDir, mine[0]))
-		mine = mine[1:]
+	sort.Strings(runs) // run IDs start with a UTC timestamp
+	for len(runs) > keep {
+		os.RemoveAll(filepath.Join(dir, runs[0]))
+		runs = runs[1:]
 	}
+}
+
+// stepBaseEnv is the host environment steps start from. When the host was
+// reached over ssh, a forwarded agent socket is dropped so build steps (which
+// run code from the commit) cannot use the controller's keys.
+func stepBaseEnv() []string {
+	env := os.Environ()
+	if os.Getenv("SSH_CONNECTION") == "" {
+		return env
+	}
+	out := env[:0:0]
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, "SSH_AUTH_SOCK=") {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
+var shaRE = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
+
+// readLimited reads a file that must not be larger than max bytes.
+func readLimited(path string, max int) ([]byte, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if fi.Size() > int64(max) {
+		return nil, fmt.Errorf("%s is larger than %d bytes", filepath.Base(path), max)
+	}
+	return os.ReadFile(path)
 }
 
 // pruneMirrorRefs drops all but the newest keep refs/xmat/* refs so old

@@ -81,3 +81,69 @@ func TestRunFilePathContainment(t *testing.T) {
 		t.Error("repo name with .. should be rejected")
 	}
 }
+
+func TestSanitize(t *testing.T) {
+	cases := map[string]string{
+		"plain text\n":                            "plain text\n",
+		"tab\tand é and 🦖":                        "tab\tand é and 🦖",
+		"err: \x1b]52;c;SGVsbG8=\x07boom":         "err: boom",
+		"err: \x1b]52;c;SGVsbG8=\x1b\\boom":       "err: boom",
+		"\x1b[1A\x1b[2Kok  ok  ok":                "ok  ok  ok",
+		"c1 csi \u009b31m red":                    "c1 csi  red",
+		"c1 osc \u009d0;title\u009c after":        "c1 osc  after",
+		"cr\roverwrite bell\a del\x7f":            "croverwrite bell del",
+		"\x1b(Bcharset":                           "charset",
+		"keeps [brackets] and ] and \\ backslash": "keeps [brackets] and ] and \\ backslash",
+		"nbsp ok": "nbsp ok",
+	}
+	for in, want := range cases {
+		if got := sanitize(in); got != want {
+			t.Errorf("sanitize(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// A sequence split across writes is still removed.
+	var sb stringsBuilder
+	f := newTermFilter(&sb)
+	for _, part := range []string{"a\x1b", "]52;c;", "SGVs\x07", "b\xc2", "\x9b2Jc"} {
+		f.Write([]byte(part))
+	}
+	if got := string(sb.b); got != "abc" {
+		t.Errorf("split sequences: got %q", got)
+	}
+	// An unterminated string stops swallowing output eventually.
+	long := "\x1b]0;" + strings.Repeat("x", maxCtlString+10) + "visible"
+	if !strings.HasSuffix(sanitize(long), "visible") {
+		t.Error("unterminated OSC swallowed everything")
+	}
+}
+
+func TestCheckDeskJob(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "xmat")
+	run := filepath.Join(root, "repos", "demo", "runs", "win-x64", "20260930T000000Z-deadbeef-aaaaaa")
+	ok := deskJob{
+		Argv: []string{"sh", "-e", filepath.Join(run, "scripts", "smoke.sh")},
+		Dir:  filepath.Join(root, "repos", "demo", "wt", "win-x64"),
+		Log:  filepath.Join(run, "smoke.log"),
+	}
+	if err := checkDeskJob(root, &ok); err != nil {
+		t.Fatalf("valid job rejected: %v", err)
+	}
+	bad := map[string]func(j *deskJob){
+		"program":      func(j *deskJob) { j.Argv = []string{"curl", "http://x", j.Argv[2]} },
+		"script ext":   func(j *deskJob) { j.Argv[2] = filepath.Join(run, "scripts", "x.exe") },
+		"script place": func(j *deskJob) { j.Argv[2] = filepath.Join(root, "evil.sh") },
+		"traversal": func(j *deskJob) {
+			j.Argv[2] = filepath.Join(run, "scripts", "..", "..", "..", "..", "..", "..", "..", "x", "scripts", "a.sh")
+		},
+		"log outside": func(j *deskJob) { j.Log = filepath.Join(t.TempDir(), "x.log") },
+		"dir outside": func(j *deskJob) { j.Dir = t.TempDir() },
+	}
+	for name, mutate := range bad {
+		j := ok
+		j.Argv = append([]string{}, ok.Argv...)
+		mutate(&j)
+		if err := checkDeskJob(root, &j); err == nil {
+			t.Errorf("%s: job accepted", name)
+		}
+	}
+}
